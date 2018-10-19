@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (C) 2017 Maxime Schmitt <maxime.schmitt91@gmail.com>
+ * Copyright (C) 2017-2018 Maxime Schmitt <maxime.schmitt91@gmail.com>
  *
  * This file is part of Nvtop.
  *
@@ -38,6 +38,15 @@
   HASH_REPLACE(hh,head,pidfield,sizeof(intmax_t),replaced)
 
 static bool nvml_initialized = false;
+
+/* To get per process utilization information
+ *
+ * The last seen timestamp per GPU.
+ * One buffer big enough for all the GPUs.
+*/
+static unsigned long long *last_gpu_timestamp;
+unsigned int utilization_buffer_size = 0;
+nvmlProcessUtilizationSample_t *utilization_buffer;
 
 bool init_gpu_info_extraction(void) {
   if (!nvml_initialized) {
@@ -247,6 +256,46 @@ retry_querry_compute:
       dinfo->compute_procs);
 }
 
+static void update_processes_utilization(struct device_info *dinfo) {
+  static nvmlAccountingStats_t accounting_buffer;
+  for (unsigned int i = 0; i < dinfo->num_compute_procs; ++i) {
+    intmax_t pid = dinfo->compute_procs[i].pid;
+    nvmlReturn_t retval;
+    if ((retval = nvmlDeviceGetAccountingStats(dinfo->device_handle, pid, &accounting_buffer)) == NVML_SUCCESS) {
+      fprintf(stderr, "COMPUTE PID %ldGPU %u%% MEM-Access %u%%\n", pid, accounting_buffer.gpuUtilization, accounting_buffer.memoryUtilization);
+    } else {
+      if (retval == NVML_ERROR_NOT_FOUND)
+        fprintf(stderr, "No stats for process id %ld\n", pid);
+      if (retval == NVML_ERROR_INVALID_ARGUMENT)
+        fprintf(stderr, "Invalid arguments\n");
+      if (retval == NVML_ERROR_NOT_SUPPORTED)
+        fprintf(stderr, "Not supported by this device\n");
+      if (retval == NVML_ERROR_UNKNOWN)
+        fprintf(stderr, "Unknown error\n");
+      if (retval == NVML_ERROR_UNINITIALIZED)
+        fprintf(stderr, "NVML uninitialized\n");
+    }
+  }
+  for (unsigned int i = 0; i < dinfo->num_graphical_procs; ++i) {
+    intmax_t pid = dinfo->graphic_procs[i].pid;
+    nvmlReturn_t retval;
+    if ((retval = nvmlDeviceGetAccountingStats(dinfo->device_handle, pid, &accounting_buffer)) == NVML_SUCCESS) {
+      fprintf(stderr, "GRAPHIC PID %ldGPU %u%% MEM-Access %u%%\n", pid, accounting_buffer.gpuUtilization, accounting_buffer.memoryUtilization);
+    } else {
+      if (retval == NVML_ERROR_NOT_FOUND)
+        fprintf(stderr, "No stats for process id %ld\n", pid);
+      if (retval == NVML_ERROR_INVALID_ARGUMENT)
+        fprintf(stderr, "Invalid arguments\n");
+      if (retval == NVML_ERROR_NOT_SUPPORTED)
+        fprintf(stderr, "Not supported by this device\n");
+      if (retval == NVML_ERROR_UNKNOWN)
+        fprintf(stderr, "Unknown error\n");
+      if (retval == NVML_ERROR_UNINITIALIZED)
+        fprintf(stderr, "NVML uninitialized\n");
+    }
+  }
+}
+
 void update_device_infos(
     unsigned int num_devs,
     struct device_info *dev_info) {
@@ -449,6 +498,7 @@ void update_device_infos(
     // Process informations
     update_graphical_process(curr_dev_info);
     update_compute_process(curr_dev_info);
+    update_processes_utilization(curr_dev_info);
 
   } // Loop over devices
 
@@ -504,6 +554,45 @@ unsigned int initialize_device_info(struct device_info **dev_info, size_t gpu_ma
       num_queriable += 1;
     }
   }
+  last_gpu_timestamp = malloc(num_queriable * sizeof(*last_gpu_timestamp));
+  unsigned int biggest_sample_count = 0;
+  for (unsigned int i = 0; i < num_queriable; ++i) {
+    unsigned int local_gpu_count;
+    nvmlEnableState_t state;
+    if (nvmlDeviceGetAccountingMode(devs[i].device_handle, &state) ==
+            NVML_SUCCESS &&
+        state == NVML_FEATURE_ENABLED) {
+      fprintf(stderr, "Accounting already enabled\n");
+    } else {
+
+      fprintf(stderr, "Accounting disabled\n");
+      if (nvmlDeviceSetAccountingMode(devs[i].device_handle,
+                                      NVML_FEATURE_ENABLED) != NVML_SUCCESS) {
+        fprintf(stderr, "Failed enabling accountin mode\n");
+      }
+    }
+    nvmlGpuVirtualizationMode_t vmode;
+    if (nvmlDeviceGetVirtualizationMode(devs[i].device_handle, &vmode) == NVML_SUCCESS) {
+      if (vmode == NVML_GPU_VIRTUALIZATION_MODE_NONE) {
+        if (nvmlDeviceSetVirtualizationMode(devs[i].device_handle, NVML_GPU_VIRTUALIZATION_MODE_PASSTHROUGH) == NVML_SUCCESS)
+          fprintf(stderr, "Set vGPU mode to passthrough\n");
+        else
+          fprintf(stderr, "Could not set vGPU mode to passthrough\n");
+      }
+      if (nvmlDeviceGetProcessUtilization(devs[i].device_handle, NULL, &local_gpu_count, 0) == NVML_SUCCESS) {
+        biggest_sample_count = biggest_sample_count > local_gpu_count
+                                   ? biggest_sample_count
+                                   : local_gpu_count;
+      } else {
+        fprintf(stderr, "No success\n");
+      }
+    } else {
+      fprintf(stderr, "Cannot querry virtualization mode\n");
+    }
+  }
+  utilization_buffer = malloc(biggest_sample_count * sizeof(*utilization_buffer));
+  utilization_buffer_size = biggest_sample_count;
+  fprintf(stderr, "Utilization samples %u\n", utilization_buffer_size);
   return num_queriable;
 }
 
